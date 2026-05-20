@@ -4,6 +4,9 @@ import argparse
 import os
 import random
 
+# Must be set before the CUDA allocator initialises (before first .to("cuda"))
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import yaml
 from huggingface_hub import hf_hub_download
@@ -76,6 +79,19 @@ def preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device):
     return obs_t
 
 
+def cast_batch(batch, dtype):
+    """Cast all floating-point tensors in a nested dict to dtype."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, dict):
+            out[k] = cast_batch(v, dtype)
+        elif isinstance(v, torch.Tensor) and v.is_floating_point():
+            out[k] = v.to(dtype)
+        else:
+            out[k] = v
+    return out
+
+
 def build_optimizer(policy, cfg):
     vlm_params = list(policy.model.vlm_with_expert.vlm.parameters())
     head_params = list(policy.model.vlm_with_expert.lm_expert.parameters())
@@ -90,9 +106,19 @@ def train(cfg):
     print(f"Using device: {device}")
 
     print(f"Loading policy from {cfg['model_id']} ...")
-    policy = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device)
-    policy_ref = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device)
+    policy = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
+    policy_ref = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
     policy_ref.requires_grad_(False)
+
+    # Gradient checkpointing on the VLM backbone recomputes activations during
+    # backward instead of storing them, trading ~2x compute for ~60% less activation
+    # memory. Only needed on the trainable policy (policy_ref never calls backward).
+    vlm = policy.model.vlm_with_expert.vlm
+    if hasattr(vlm, "gradient_checkpointing_enable"):
+        vlm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
     policy.train()
 
     # Build lerobot preprocessing pipeline (identical to evaluate.py)
@@ -133,6 +159,7 @@ def train(cfg):
             continue
 
         obs_batch = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
+        obs_batch = cast_batch(obs_batch, next(policy.parameters()).dtype)
 
         # Sample group of n trajectories (prefix KV-cache computed once for all n)
         group_data = sample_group_trajectories(policy, obs_batch, n_group=cfg["n_group"])
@@ -163,6 +190,7 @@ def train(cfg):
             print(f"  Checkpoint saved → {ckpt_path}")
 
         env.close()
+        torch.cuda.empty_cache()
 
     final_path = os.path.join(cfg["output_dir"], f"step_{cfg['total_steps']}")
     policy.save_pretrained(final_path)
@@ -193,10 +221,11 @@ def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, pos
             done = False
             for _step in range(env._max_episode_steps):
                 obs_t = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
-                with torch.inference_mode():
+                obs_t = cast_batch(obs_t, next(policy.parameters()).dtype)
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                     action = policy.select_action(obs_t)
                 action = postprocessor(action)
-                act_np = action.squeeze(0).cpu().numpy()
+                act_np = action.squeeze(0).cpu().float().numpy()
                 obs, _, terminated, truncated, info = env.step(act_np)
                 done = terminated or truncated
                 if done:

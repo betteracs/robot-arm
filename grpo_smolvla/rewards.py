@@ -52,7 +52,7 @@ def compute_weighted_reward(raw_env, group_trajectory, postprocessor):
 
         # Denormalize policy actions to robot action space before stepping env
         actions_denorm = postprocessor(actions_tensor)
-        actions_np = actions_denorm.squeeze(0).cpu().numpy()  # (chunk_size, action_dim)
+        actions_np = actions_denorm.squeeze(0).cpu().float().numpy()  # (chunk_size, action_dim)
         return execute_and_score(raw_env, actions_np)
 
     r8  = run_horizon(group_trajectory["actions_8"])

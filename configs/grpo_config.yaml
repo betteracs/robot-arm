@@ -2,7 +2,7 @@ model_id: "lerobot/smolvla_libero"
 task_suite: "libero_10"
 
 # GRPO hyperparameters
-n_group: 8
+n_group: 4
 clip_eps: 0.2
 kl_coeff: 0.01
 denoising_weights:

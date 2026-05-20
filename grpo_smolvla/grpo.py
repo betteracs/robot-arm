@@ -30,8 +30,10 @@ def flow_matching_log_prob(policy, obs_batch, noise, actions_target):
 
     Returns: scalar tensor (requires_grad for policy update, detached for reference)
     """
-    batch = {**obs_batch, ACTION: actions_target}
-    loss, _ = policy.forward(batch, noise=noise)
+    model_dtype = next(policy.parameters()).dtype
+    batch = {**obs_batch, ACTION: actions_target.to(model_dtype)}
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss, _ = policy.forward(batch, noise=noise.to(model_dtype))
     return -loss  # tensor with gradient path intact
 
 
@@ -53,8 +55,10 @@ def grpo_update(policy, policy_ref, optimizer, obs_batch, group_data, advantages
     Returns: scalar loss float
     """
     device = next(policy.parameters()).device
-    total_loss = torch.tensor(0.0, device=device)
+    n = len(group_data)
+    running_loss = 0.0
 
+    optimizer.zero_grad()
     for traj, adv in zip(group_data, advantages):
         adv = adv.to(device)
 
@@ -70,15 +74,13 @@ def grpo_update(policy, policy_ref, optimizer, obs_batch, group_data, advantages
         clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
 
         policy_loss = -torch.min(ratio * adv, clipped_ratio * adv)
-
-        # KL penalty encourages staying close to the SFT prior
         kl_penalty = kl_coeff * (log_prob_new - log_prob_ref.detach())
 
-        total_loss = total_loss + policy_loss + kl_penalty
+        # Divide by n here so accumulated gradients equal the mean over the group
+        step_loss = (policy_loss + kl_penalty) / n
+        step_loss.backward()
+        running_loss += step_loss.item()
 
-    total_loss = total_loss / len(group_data)
-    optimizer.zero_grad()
-    total_loss.backward()
     torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
     optimizer.step()
-    return total_loss.item()
+    return running_loss

@@ -98,7 +98,7 @@ def evaluate_policy(policy, preprocessor, postprocessor, task_suite_name,
 
                 # postprocessor: unnormalize action
                 action = postprocessor(action)
-                act_np = action.squeeze(0).cpu().numpy()
+                act_np = action.squeeze(0).cpu().float().numpy()
 
                 obs, reward, terminated, truncated, info = env.step(act_np)
                 done = terminated or truncated

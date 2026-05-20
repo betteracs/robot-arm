@@ -20,7 +20,7 @@ def compute_prefix_cache(policy, obs_batch):
     lang_tokens = obs_batch["observation.language.tokens"]
     lang_masks = obs_batch["observation.language.attention_mask"]
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
@@ -54,10 +54,10 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     bsize = noise.shape[0]
     device = noise.device
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for step in range(num_steps):
             time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_tensor = torch.tensor(time, dtype=noise.dtype, device=device).expand(bsize)
             v_t = flow_model.denoise_step(
                 x_t=x_t,
                 prefix_pad_masks=prefix_cache["prefix_pad_masks"],
@@ -85,6 +85,7 @@ def sample_group_trajectories(policy, obs_batch, n_group=8):
     B = 1
     action_shape = (B, model.config.chunk_size, model.config.max_action_dim)
     device = next(policy.parameters()).device
+    model_dtype = next(policy.parameters()).dtype
     # Trim denoised actions to the original (non-padded) action dim, matching lerobot's
     # _get_action_chunk which does: actions = actions[:, :, :original_action_dim]
     original_action_dim = policy.config.action_feature.shape[0]
@@ -93,7 +94,7 @@ def sample_group_trajectories(policy, obs_batch, n_group=8):
 
     group = []
     for _ in range(n_group):
-        zi = torch.randn(action_shape, device=device)
+        zi = torch.randn(action_shape, device=device, dtype=model_dtype)
         a8  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=8)[:, :, :original_action_dim]
         a9  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=9)[:, :, :original_action_dim]
         a10 = rollout_with_n_steps(model, prefix_cache, zi, num_steps=10)[:, :, :original_action_dim]
