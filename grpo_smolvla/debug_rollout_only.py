@@ -90,7 +90,7 @@ def main():
         rewards = []
         for ep in group_episodes:
             r = compute_episode_reward(
-                policy, ep["traj"]["actions_10"], postprocessor,
+                policy, ep["traj"]["primary_actions"], postprocessor,
                 preprocess_obs_fn, env, ep["task_language"],
                 raw_env, ep["sim_state"], ep["saved_timestep"],
                 env._max_episode_steps,

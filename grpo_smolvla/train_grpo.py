@@ -160,6 +160,14 @@ def train(cfg):
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
+    # Multi-denoise reward: each member is rolled out once per denoise level and
+    # combined as a weighted sum. denoise_levels and weights come from config.
+    denoising_weights = {int(k): float(v) for k, v in cfg["denoising_weights"].items()}
+    denoise_levels = sorted(denoising_weights.keys())
+    primary_denoise = max(denoise_levels)
+    print(f"Multi-denoise reward: levels={denoise_levels}, weights={denoising_weights}, "
+          f"primary (GRPO log-prob) level={primary_denoise}")
+
     print(f"Starting GRPO training for {cfg['total_steps']} steps ...")
     for step in range(cfg["total_steps"]):
         task_id = random.randint(0, n_tasks - 1)
@@ -189,21 +197,54 @@ def train(cfg):
                 torch.cuda.empty_cache()
                 continue
 
+            # Cap training-time rollout horizon (eval path is unaffected).
+            if cfg.get("max_episode_steps_train") is not None:
+                max_steps = min(max_steps, int(cfg["max_episode_steps_train"]))
+
             group_episodes = []
             for obs in obs_list:
                 obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
                 obs_batch_i = cast_batch(obs_batch_i, model_dtype)
-                traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
+                traj_i = sample_group_trajectories(
+                    policy, obs_batch_i, denoise_levels=denoise_levels, n_group=1,
+                )[0]
                 group_episodes.append({"obs_batch": obs_batch_i, "traj": traj_i})
 
-            first_chunks_np = [
-                postprocessor(ep["traj"]["actions_10"]).squeeze(0).cpu().float().numpy()
-                for ep in group_episodes
+            # Snapshot every worker's fresh init state — we restore to this before
+            # each per-denoise-level rollout so all denoise levels start identically.
+            try:
+                saved_states = pool.save_states()
+            except Exception as e:
+                print(f"  [step {step}] pool save_states failed: {e} — skipping step")
+                torch.cuda.empty_cache()
+                continue
+
+            # Roll out each denoise level in turn → per-level binary rewards.
+            per_level_rewards = {}
+            for d in denoise_levels:
+                try:
+                    pool.restore_states(saved_states)
+                except Exception as e:
+                    print(f"  [step {step}] pool restore_states (d={d}) failed: {e} — skipping step")
+                    per_level_rewards = None
+                    break
+                chunks_np = [
+                    postprocessor(ep["traj"]["actions"][d]).squeeze(0).cpu().float().numpy()
+                    for ep in group_episodes
+                ]
+                per_level_rewards[d] = parallel_compute_rewards(
+                    pool, policy, chunks_np, task_language,
+                    preprocess_obs_fn, postprocessor, max_steps,
+                )
+
+            if per_level_rewards is None:
+                torch.cuda.empty_cache()
+                continue
+
+            rewards = [
+                sum(denoising_weights[d] * per_level_rewards[d][i] for d in denoise_levels)
+                for i in range(cfg["n_group"])
             ]
-            rewards = parallel_compute_rewards(
-                pool, policy, first_chunks_np, task_language,
-                preprocess_obs_fn, postprocessor, max_steps,
-            )
         else:
             # --- Serial rollout path (original) ---
             try:
@@ -221,6 +262,12 @@ def train(cfg):
                 torch.cuda.empty_cache()
                 continue
 
+            # Cap training-time rollout horizon (eval path is unaffected).
+            if cfg.get("max_episode_steps_train") is not None:
+                env._max_episode_steps = min(
+                    env._max_episode_steps, int(cfg["max_episode_steps_train"])
+                )
+
             group_episodes = []
             raw_env = env._env
             skip_step = False
@@ -235,7 +282,9 @@ def train(cfg):
 
                 obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
                 obs_batch_i = cast_batch(obs_batch_i, model_dtype)
-                traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
+                traj_i = sample_group_trajectories(
+                    policy, obs_batch_i, denoise_levels=denoise_levels, n_group=1,
+                )[0]
 
                 group_episodes.append({
                     "obs_batch": obs_batch_i,
@@ -250,15 +299,21 @@ def train(cfg):
                 torch.cuda.empty_cache()
                 continue
 
+            # compute_episode_reward restores sim_state on every call, so calling
+            # it len(denoise_levels) times per member is safe — each rollout starts
+            # from the same fresh init state.
             rewards = []
             for ep in group_episodes:
-                r = compute_episode_reward(
-                    policy, ep["traj"]["actions_10"], postprocessor,
-                    preprocess_obs_fn, env, ep["task_language"],
-                    raw_env, ep["sim_state"], ep["saved_timestep"],
-                    env._max_episode_steps,
-                )
-                rewards.append(r)
+                weighted = 0.0
+                for d in denoise_levels:
+                    r = compute_episode_reward(
+                        policy, ep["traj"]["actions"][d], postprocessor,
+                        preprocess_obs_fn, env, ep["task_language"],
+                        raw_env, ep["sim_state"], ep["saved_timestep"],
+                        env._max_episode_steps,
+                    )
+                    weighted += denoising_weights[d] * r
+                rewards.append(weighted)
 
         advantages = compute_grpo_advantages(rewards)
 

@@ -63,7 +63,7 @@ def training_style_rollout(policy, env, env_preprocessor, preprocessor, postproc
         )
 
     return compute_episode_reward(
-        policy, traj["actions_10"], postprocessor,
+        policy, traj["primary_actions"], postprocessor,
         preprocess_obs_fn, env, task_lang,
         raw_env, sim_state, saved_timestep,
         env._max_episode_steps,

@@ -4,7 +4,7 @@ import torch
 
 def compute_episode_reward(
     policy,
-    traj_actions_10,
+    first_chunk_actions,
     postprocessor,
     preprocess_obs_fn,
     env,
@@ -17,9 +17,10 @@ def compute_episode_reward(
     """
     Roll out a full episode and return binary success {0.0, 1.0}.
 
-    First chunk comes from the GRPO-sampled traj_actions_10 (so the policy
-    gradient flows through it). All subsequent chunks re-query the policy
-    closed-loop from the current observation, matching eval behaviour.
+    First chunk comes from a GRPO-sampled denoising trajectory (so the policy
+    gradient can flow through it when the primary chunk is rolled out). All
+    subsequent chunks re-query the policy closed-loop from the current
+    observation, matching eval behaviour.
 
     preprocess_obs_fn: callable(gym_obs, task_language) -> policy input batch
     env:               LiberoEnv — used only for _format_raw_obs conversion
@@ -35,7 +36,7 @@ def compute_episode_reward(
     raw_env.env._obs_cache = {}
 
     # --- First chunk: from the GRPO trajectory ---
-    first_chunk = postprocessor(traj_actions_10).squeeze(0).cpu().float().numpy()
+    first_chunk = postprocessor(first_chunk_actions).squeeze(0).cpu().float().numpy()
 
     raw_obs = None
     for act in first_chunk:

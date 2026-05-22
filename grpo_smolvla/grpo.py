@@ -51,7 +51,9 @@ def grpo_update(policy, policy_ref, optimizer, group_episodes, advantages, clip_
     optimizer:      AdamW with differential LRs
     group_episodes: list of dicts, each with:
                       obs_batch  — preprocessed observation for this episode
-                      traj       — dict with keys noise, actions_10
+                      traj       — dict with keys noise, primary_actions
+                                   (primary_actions = canonical-denoise chunk
+                                   used as the GRPO trajectory)
     advantages:     FloatTensor of shape (n,) from compute_grpo_advantages
     clip_eps:       PPO clipping threshold (default 0.2)
     kl_coeff:       KL regularization weight against SFT prior
@@ -74,11 +76,11 @@ def grpo_update(policy, policy_ref, optimizer, group_episodes, advantages, clip_
         time = policy.model.sample_time(1, device)
 
         log_prob_new = flow_matching_log_prob(
-            policy, obs_batch, traj["noise"], traj["actions_10"], time=time
+            policy, obs_batch, traj["noise"], traj["primary_actions"], time=time
         )
         with torch.no_grad():
             log_prob_ref = flow_matching_log_prob(
-                policy_ref, obs_batch, traj["noise"], traj["actions_10"], time=time
+                policy_ref, obs_batch, traj["noise"], traj["primary_actions"], time=time
             )
 
         ratio = torch.exp(log_prob_new - log_prob_ref.detach())
