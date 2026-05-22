@@ -151,7 +151,7 @@ def worker_main(
     # ------------------------------------------------------------------
     # STEP 2: Load policy to this worker's GPU (CUDA initialises here).
     # ------------------------------------------------------------------
-    device = f"cuda:{rank - 1}"  # rank 0 is the trainer; workers start at rank 1
+    device = f"cuda:{rank}"  # rank 0 is the trainer; workers use their own rank GPU
     policy_inference = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(
         device=device, dtype=torch.bfloat16
     )
