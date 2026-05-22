@@ -12,8 +12,6 @@ Each worker process:
 import datetime
 import os
 
-import numpy as np
-
 # Must be set before any numpy/torch imports in this process.
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):

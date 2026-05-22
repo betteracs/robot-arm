@@ -496,7 +496,17 @@ def train_multi_gpu(cfg):
             max_steps = max_steps_cap
             reset_ok = True
             for i, rq in enumerate(recv_queues):
-                msg = rq.get(timeout=120)
+                try:
+                    msg = rq.get(timeout=120)
+                except _QueueEmpty:
+                    print(f"  [step {step}] Worker {i} timed out during reset (crashed?) — aborting", flush=True)
+                    reset_ok = False
+                    for drain_rq in recv_queues[i + 1:]:
+                        try:
+                            drain_rq.get(timeout=5)
+                        except _QueueEmpty:
+                            pass
+                    break
                 if msg[0] == "error":
                     print(f"  [step {step}] Worker {i} reset error: {msg[1]} — skipping step")
                     reset_ok = False
@@ -537,7 +547,17 @@ def train_multi_gpu(cfg):
             per_level_rewards = {}
             rollout_ok = True
             for i, (level, rq) in enumerate(zip(denoise_levels, recv_queues)):
-                msg = rq.get(timeout=300)
+                try:
+                    msg = rq.get(timeout=300)
+                except _QueueEmpty:
+                    print(f"  [step {step}] Worker {i} timed out during rollout (crashed?) — aborting", flush=True)
+                    rollout_ok = False
+                    for drain_rq in recv_queues[i + 1:]:
+                        try:
+                            drain_rq.get(timeout=5)
+                        except _QueueEmpty:
+                            pass
+                    break
                 if msg[0] == "error":
                     print(f"  [step {step}] Worker {i} rollout error: {msg[1]} — skipping step")
                     rollout_ok = False
@@ -601,7 +621,7 @@ def train_multi_gpu(cfg):
             except Exception:
                 pass
         for p in worker_procs:
-            p.join(timeout=5)
+            p.join(timeout=30)
             if p.is_alive():
                 p.terminate()
         if dist.is_initialized():
