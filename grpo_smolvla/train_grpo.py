@@ -21,6 +21,7 @@ from safetensors.torch import load_file
 
 from grpo_smolvla.flow_utils import sample_group_trajectories
 from grpo_smolvla.grpo import compute_grpo_advantages, grpo_update
+from grpo_smolvla.parallel_rollout import ParallelEnvPool, parallel_compute_rewards
 from grpo_smolvla.rewards import compute_episode_reward
 
 
@@ -137,6 +138,15 @@ def train(cfg):
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
+    # Optional parallel rollout pool: spawns n_group worker processes that each hold
+    # one LiberoEnv. Trades subprocess overhead for ~n_group× wall-clock speedup on
+    # the env-bound rollout phase. Pool persists for the whole training run.
+    use_parallel = cfg.get("use_parallel_rollout", False)
+    pool = None
+    if use_parallel:
+        print(f"Spawning ParallelEnvPool with {cfg['n_group']} workers ...")
+        pool = ParallelEnvPool(cfg["n_group"], cfg["task_suite"])
+
     print(f"Starting GRPO training for {cfg['total_steps']} steps ...")
     for step in range(cfg["total_steps"]):
         task_id = random.randint(0, n_tasks - 1)
@@ -146,20 +156,6 @@ def train(cfg):
         # so success-rate gains measure held-out generalisation.
         n_train_inits = cfg.get("n_train_init_states", 40)
         episode_start = (step * cfg["n_group"]) % n_train_inits
-        try:
-            env = LiberoEnv(
-                task_suite=suite,
-                task_id=task_id,
-                task_suite_name=cfg["task_suite"],
-                obs_type="pixels_agent_pos",
-                observation_height=256,
-                observation_width=256,
-                episode_index=episode_start,
-            )
-        except Exception as e:
-            print(f"  [step {step}] env construction failed (task_id={task_id}): {e} — skipping step")
-            torch.cuda.empty_cache()
-            continue
 
         model_dtype = next(policy.parameters()).dtype
 
@@ -169,49 +165,87 @@ def train(cfg):
                 model_dtype,
             )
 
-        # Collect one episode per group member, each from a different init state.
-        # This guarantees reward diversity across the group: different init states
-        # have different task difficulties, so we consistently get mixed outcomes.
-        group_episodes = []
-        raw_env = env._env
-        skip_step = False
-        for _ in range(cfg["n_group"]):
+        env = None
+        if pool is not None:
+            # --- Parallel rollout path ---
+            episode_indices = [(episode_start + i) % n_train_inits for i in range(cfg["n_group"])]
             try:
-                obs, info = env.reset()
-                task_language = env.task_description
+                obs_list, task_language, max_steps = pool.reset_to_task(task_id, episode_indices)
             except Exception as e:
-                print(f"  [step {step}] env reset failed: {e} — skipping step")
-                skip_step = True
-                break
+                print(f"  [step {step}] pool reset failed (task_id={task_id}): {e} — skipping step")
+                torch.cuda.empty_cache()
+                continue
 
-            obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
-            obs_batch_i = cast_batch(obs_batch_i, model_dtype)
+            group_episodes = []
+            for obs in obs_list:
+                obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
+                obs_batch_i = cast_batch(obs_batch_i, model_dtype)
+                traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
+                group_episodes.append({"obs_batch": obs_batch_i, "traj": traj_i})
 
-            # Sample ONE trajectory from this init state
-            traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
-
-            group_episodes.append({
-                "obs_batch": obs_batch_i,
-                "traj": traj_i,
-                "sim_state": raw_env.sim.get_state(),
-                "saved_timestep": raw_env.env.timestep,
-                "task_language": task_language,
-            })
-
-        if skip_step:
-            env.close()
-            torch.cuda.empty_cache()
-            continue
-
-        rewards = []
-        for ep in group_episodes:
-            r = compute_episode_reward(
-                policy, ep["traj"]["actions_10"], postprocessor,
-                preprocess_obs_fn, env, ep["task_language"],
-                raw_env, ep["sim_state"], ep["saved_timestep"],
-                env._max_episode_steps,
+            first_chunks_np = [
+                postprocessor(ep["traj"]["actions_10"]).squeeze(0).cpu().float().numpy()
+                for ep in group_episodes
+            ]
+            rewards = parallel_compute_rewards(
+                pool, policy, first_chunks_np, task_language,
+                preprocess_obs_fn, postprocessor, max_steps,
             )
-            rewards.append(r)
+        else:
+            # --- Serial rollout path (original) ---
+            try:
+                env = LiberoEnv(
+                    task_suite=suite,
+                    task_id=task_id,
+                    task_suite_name=cfg["task_suite"],
+                    obs_type="pixels_agent_pos",
+                    observation_height=256,
+                    observation_width=256,
+                    episode_index=episode_start,
+                )
+            except Exception as e:
+                print(f"  [step {step}] env construction failed (task_id={task_id}): {e} — skipping step")
+                torch.cuda.empty_cache()
+                continue
+
+            group_episodes = []
+            raw_env = env._env
+            skip_step = False
+            for _ in range(cfg["n_group"]):
+                try:
+                    obs, info = env.reset()
+                    task_language = env.task_description
+                except Exception as e:
+                    print(f"  [step {step}] env reset failed: {e} — skipping step")
+                    skip_step = True
+                    break
+
+                obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
+                obs_batch_i = cast_batch(obs_batch_i, model_dtype)
+                traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
+
+                group_episodes.append({
+                    "obs_batch": obs_batch_i,
+                    "traj": traj_i,
+                    "sim_state": raw_env.sim.get_state(),
+                    "saved_timestep": raw_env.env.timestep,
+                    "task_language": task_language,
+                })
+
+            if skip_step:
+                env.close()
+                torch.cuda.empty_cache()
+                continue
+
+            rewards = []
+            for ep in group_episodes:
+                r = compute_episode_reward(
+                    policy, ep["traj"]["actions_10"], postprocessor,
+                    preprocess_obs_fn, env, ep["task_language"],
+                    raw_env, ep["sim_state"], ep["saved_timestep"],
+                    env._max_episode_steps,
+                )
+                rewards.append(r)
 
         advantages = compute_grpo_advantages(rewards)
 
@@ -222,7 +256,8 @@ def train(cfg):
         # learning signal, and the KL-only gradient would cause policy drift.
         if len(set(rewards)) == 1:
             print(f"Step {step:5d} | skip (uniform rewards={rewards_str}) | task={task_language[:40]}")
-            env.close()
+            if env is not None:
+                env.close()
             torch.cuda.empty_cache()
             continue
 
@@ -241,8 +276,13 @@ def train(cfg):
             policy.save_pretrained(ckpt_path)
             print(f"  Checkpoint saved → {ckpt_path}")
 
-        env.close()
+        if env is not None:
+            env.close()
         torch.cuda.empty_cache()
+
+    if pool is not None:
+        print("Shutting down ParallelEnvPool ...")
+        pool.close()
 
     final_path = os.path.join(cfg["output_dir"], f"step_{cfg['total_steps']}")
     policy.save_pretrained(final_path)
