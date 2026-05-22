@@ -19,7 +19,7 @@ def compute_grpo_advantages(rewards, eps=1e-8):
     return advantages
 
 
-def flow_matching_log_prob(policy, obs_batch, noise, actions_target):
+def flow_matching_log_prob(policy, obs_batch, noise, actions_target, time=None):
     """
     Approximate log π_θ(τ | o) via the flow-matching regression loss.
 
@@ -28,46 +28,57 @@ def flow_matching_log_prob(policy, obs_batch, noise, actions_target):
     Higher log-prob = lower FM loss. This is the score-function estimator
     approach described in §4.4 of the proposal.
 
+    time: pre-sampled time tensor (must be the SAME for policy and reference calls
+          so the FM loss is evaluated at identical noise levels).
+
     Returns: scalar tensor (requires_grad for policy update, detached for reference)
     """
     model_dtype = next(policy.parameters()).dtype
     batch = {**obs_batch, ACTION: actions_target.to(model_dtype)}
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        loss, _ = policy.forward(batch, noise=noise.to(model_dtype))
+        loss, _ = policy.forward(batch, noise=noise.to(model_dtype), time=time)
     return -loss  # tensor with gradient path intact
 
 
-def grpo_update(policy, policy_ref, optimizer, obs_batch, group_data, advantages, clip_eps=0.2, kl_coeff=0.01):
+def grpo_update(policy, policy_ref, optimizer, group_episodes, advantages, clip_eps=0.2, kl_coeff=0.01):
     """
     L_GRPO = -E[min(ρ_i * Â_i, clip(ρ_i, 1-ε, 1+ε) * Â_i)] + kl_coeff * KL(π_θ || π_ref)
 
     ρ_i = exp(log π_θ(τ_i) - log π_θ_old(τ_i))
 
-    policy:     trainable SmolVLAPolicy
-    policy_ref: frozen SFT reference policy (requires_grad=False)
-    optimizer:  AdamW with differential LRs
-    obs_batch:  observation dict
-    group_data: list of dicts with keys noise, actions_8, actions_9, actions_10
-    advantages: FloatTensor of shape (n,) from compute_grpo_advantages
-    clip_eps:   PPO clipping threshold (default 0.2)
-    kl_coeff:   KL regularization weight against SFT prior
+    policy:         trainable SmolVLAPolicy
+    policy_ref:     frozen SFT reference policy (requires_grad=False)
+    optimizer:      AdamW with differential LRs
+    group_episodes: list of dicts, each with:
+                      obs_batch  — preprocessed observation for this episode
+                      traj       — dict with keys noise, actions_10
+    advantages:     FloatTensor of shape (n,) from compute_grpo_advantages
+    clip_eps:       PPO clipping threshold (default 0.2)
+    kl_coeff:       KL regularization weight against SFT prior
 
     Returns: scalar loss float
     """
     device = next(policy.parameters()).device
-    n = len(group_data)
+    n = len(group_episodes)
     running_loss = 0.0
 
     optimizer.zero_grad()
-    for traj, adv in zip(group_data, advantages):
+    for ep, adv in zip(group_episodes, advantages):
         adv = adv.to(device)
+        obs_batch = ep["obs_batch"]
+        traj = ep["traj"]
+
+        # Sample time ONCE so both policy and reference evaluate the FM loss at
+        # the same noise level — using independent random times would make
+        # log_prob_new - log_prob_ref dominated by sampling noise, not policy diff.
+        time = policy.model.sample_time(1, device)
 
         log_prob_new = flow_matching_log_prob(
-            policy, obs_batch, traj["noise"], traj["actions_10"]
+            policy, obs_batch, traj["noise"], traj["actions_10"], time=time
         )
         with torch.no_grad():
             log_prob_ref = flow_matching_log_prob(
-                policy_ref, obs_batch, traj["noise"], traj["actions_10"]
+                policy_ref, obs_batch, traj["noise"], traj["actions_10"], time=time
             )
 
         ratio = torch.exp(log_prob_new - log_prob_ref.detach())

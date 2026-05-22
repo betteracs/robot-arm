@@ -1,62 +1,78 @@
-"""Weighted denoising reward: R = 0.1*r8 + 0.2*r9 + 0.7*r10."""
+"""Episode-level success reward for GRPO training on LIBERO."""
+import torch
 
-import numpy as np
 
-
-def execute_and_score(raw_env, actions_np):
+def compute_episode_reward(
+    policy,
+    traj_actions_10,
+    postprocessor,
+    preprocess_obs_fn,
+    env,
+    task_language,
+    raw_env,
+    sim_state,
+    saved_timestep,
+    max_episode_steps,
+):
     """
-    Execute an action chunk in a LIBERO OffScreenRenderEnv and return binary success {0, 1}.
+    Roll out a full episode and return binary success {0.0, 1.0}.
 
-    raw_env:    OffScreenRenderEnv (not LiberoEnv); returns 4-tuple from step()
-    actions_np: ndarray of shape (chunk_size, action_dim) — already denormalized
+    First chunk comes from the GRPO-sampled traj_actions_10 (so the policy
+    gradient flows through it). All subsequent chunks re-query the policy
+    closed-loop from the current observation, matching eval behaviour.
+
+    preprocess_obs_fn: callable(gym_obs, task_language) -> policy input batch
+    env:               LiberoEnv — used only for _format_raw_obs conversion
+    raw_env:           OffScreenRenderEnv — stepped directly (no auto-reset)
+    sim_state:         MjSimState saved right after env.reset()
+    saved_timestep:    robosuite timestep counter at that same point
     """
-    done = False
-    success = 0
-    for act in actions_np:
-        if done:
-            break
+    # Restore every group member to the same initial state
+    raw_env.sim.set_state(sim_state)
+    raw_env.sim.forward()
+    raw_env.env.timestep = saved_timestep
+    raw_env.env.done = False
+    raw_env.env._obs_cache = {}
+
+    # --- First chunk: from the GRPO trajectory ---
+    first_chunk = postprocessor(traj_actions_10).squeeze(0).cpu().float().numpy()
+
+    raw_obs = None
+    for act in first_chunk:
         try:
-            obs, reward, done, info = raw_env.step(act)
+            raw_obs, _, done, _ = raw_env.step(act)
         except ValueError:
-            # "executing action in terminated episode" — treat as not successful
-            break
-        if info.get("success", False):
-            success = 1
-            break
-    return success
+            return 0.0
+        if done:
+            return 1.0
 
+    if raw_obs is None:
+        return 0.0
 
-def compute_weighted_reward(raw_env, group_trajectory, postprocessor):
-    """
-    R(τ_i) = 0.1 * r(τ_i^8) + 0.2 * r(τ_i^9) + 0.7 * r(τ_i^10)
+    # --- Remaining chunks: closed-loop policy re-query ---
+    was_training = policy.training
+    policy.eval()
+    policy.reset()  # clear the action queue
 
-    raw_env:          OffScreenRenderEnv (already reset and stabilized via LiberoEnv.reset())
-    group_trajectory: dict with actions_8, actions_9, actions_10 tensors (normalized)
-    postprocessor:    callable that unnormalizes action tensors before env.step()
+    steps_done = len(first_chunk)
+    try:
+        while steps_done < max_episode_steps:
+            gym_obs = env._format_raw_obs(raw_obs)
+            obs_batch = preprocess_obs_fn(gym_obs, task_language)
 
-    For each denoising horizon, the sim state is restored to the post-stabilization
-    state so all three sub-trajectories start from the same configuration.
-    """
-    # Save MuJoCo sim state and robosuite env counters after stabilization
-    sim_state = raw_env.sim.get_state()
-    saved_timestep = raw_env.env.timestep
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                action = policy.select_action(obs_batch)
+            act_np = postprocessor(action).squeeze(0).cpu().float().numpy()
 
-    def run_horizon(actions_tensor):
-        # Restore sim state
-        raw_env.sim.set_state(sim_state)
-        raw_env.sim.forward()
-        # Reset robosuite counters so step() doesn't raise "terminated episode"
-        raw_env.env.timestep = saved_timestep
-        raw_env.env.done = False
-        raw_env.env._obs_cache = {}
+            try:
+                raw_obs, _, done, _ = raw_env.step(act_np)
+            except ValueError:
+                break
+            if done:
+                return 1.0
+            steps_done += 1
+    finally:
+        if was_training:
+            policy.train()
 
-        # Denormalize policy actions to robot action space before stepping env
-        actions_denorm = postprocessor(actions_tensor)
-        actions_np = actions_denorm.squeeze(0).cpu().float().numpy()  # (chunk_size, action_dim)
-        return execute_and_score(raw_env, actions_np)
-
-    r8  = run_horizon(group_trajectory["actions_8"])
-    r9  = run_horizon(group_trajectory["actions_9"])
-    r10 = run_horizon(group_trajectory["actions_10"])
-
-    return 0.1 * r8 + 0.2 * r9 + 0.7 * r10
+    return 0.0

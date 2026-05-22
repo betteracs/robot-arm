@@ -21,7 +21,7 @@ from safetensors.torch import load_file
 
 from grpo_smolvla.flow_utils import sample_group_trajectories
 from grpo_smolvla.grpo import compute_grpo_advantages, grpo_update
-from grpo_smolvla.rewards import compute_weighted_reward
+from grpo_smolvla.rewards import compute_episode_reward
 
 
 def load_config(path):
@@ -141,45 +141,97 @@ def train(cfg):
     for step in range(cfg["total_steps"]):
         task_id = random.randint(0, n_tasks - 1)
 
-        env = LiberoEnv(
-            task_suite=suite,
-            task_id=task_id,
-            task_suite_name=cfg["task_suite"],
-            obs_type="pixels_agent_pos",
-            observation_height=256,
-            observation_width=256,
-        )
-
+        # Train/eval init-state split: training only sees init states
+        # [0..n_train_init_states-1]; eval uses [n_train_init_states..49]
+        # so success-rate gains measure held-out generalisation.
+        n_train_inits = cfg.get("n_train_init_states", 40)
+        episode_start = (step * cfg["n_group"]) % n_train_inits
         try:
-            obs, info = env.reset()
-            task_language = env.task_description
+            env = LiberoEnv(
+                task_suite=suite,
+                task_id=task_id,
+                task_suite_name=cfg["task_suite"],
+                obs_type="pixels_agent_pos",
+                observation_height=256,
+                observation_width=256,
+                episode_index=episode_start,
+            )
         except Exception as e:
-            print(f"  [step {step}] env reset failed: {e} — skipping")
-            env.close()
+            print(f"  [step {step}] env construction failed (task_id={task_id}): {e} — skipping step")
+            torch.cuda.empty_cache()
             continue
 
-        obs_batch = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
-        obs_batch = cast_batch(obs_batch, next(policy.parameters()).dtype)
+        model_dtype = next(policy.parameters()).dtype
 
-        # Sample group of n trajectories (prefix KV-cache computed once for all n)
-        group_data = sample_group_trajectories(policy, obs_batch, n_group=cfg["n_group"])
+        def preprocess_obs_fn(obs, lang):
+            return cast_batch(
+                preprocess_obs(obs, lang, env_preprocessor, preprocessor, device),
+                model_dtype,
+            )
 
-        # Compute weighted rewards from the shared initial sim state
-        raw_env = env._env  # OffScreenRenderEnv — needed for sim state save/restore
+        # Collect one episode per group member, each from a different init state.
+        # This guarantees reward diversity across the group: different init states
+        # have different task difficulties, so we consistently get mixed outcomes.
+        group_episodes = []
+        raw_env = env._env
+        skip_step = False
+        for _ in range(cfg["n_group"]):
+            try:
+                obs, info = env.reset()
+                task_language = env.task_description
+            except Exception as e:
+                print(f"  [step {step}] env reset failed: {e} — skipping step")
+                skip_step = True
+                break
+
+            obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
+            obs_batch_i = cast_batch(obs_batch_i, model_dtype)
+
+            # Sample ONE trajectory from this init state
+            traj_i = sample_group_trajectories(policy, obs_batch_i, n_group=1)[0]
+
+            group_episodes.append({
+                "obs_batch": obs_batch_i,
+                "traj": traj_i,
+                "sim_state": raw_env.sim.get_state(),
+                "saved_timestep": raw_env.env.timestep,
+                "task_language": task_language,
+            })
+
+        if skip_step:
+            env.close()
+            torch.cuda.empty_cache()
+            continue
+
         rewards = []
-        for traj in group_data:
-            r = compute_weighted_reward(raw_env, traj, postprocessor)
+        for ep in group_episodes:
+            r = compute_episode_reward(
+                policy, ep["traj"]["actions_10"], postprocessor,
+                preprocess_obs_fn, env, ep["task_language"],
+                raw_env, ep["sim_state"], ep["saved_timestep"],
+                env._max_episode_steps,
+            )
             rewards.append(r)
 
         advantages = compute_grpo_advantages(rewards)
 
+        mean_r = sum(rewards) / len(rewards)
+        rewards_str = "[" + ",".join(f"{r:.1f}" for r in rewards) + "]"
+
+        # Skip update when all rewards are identical — zero advantage means no
+        # learning signal, and the KL-only gradient would cause policy drift.
+        if len(set(rewards)) == 1:
+            print(f"Step {step:5d} | skip (uniform rewards={rewards_str}) | task={task_language[:40]}")
+            env.close()
+            torch.cuda.empty_cache()
+            continue
+
         loss = grpo_update(
-            policy, policy_ref, optimizer, obs_batch, group_data, advantages,
+            policy, policy_ref, optimizer, group_episodes, advantages,
             clip_eps=cfg["clip_eps"], kl_coeff=cfg["kl_coeff"],
         )
 
-        mean_r = sum(rewards) / len(rewards)
-        print(f"Step {step:5d} | loss={loss:.4f} | mean_reward={mean_r:.3f} | task={task_language[:40]}")
+        print(f"Step {step:5d} | loss={loss:.4f} | mean_reward={mean_r:.3f} | rewards={rewards_str} | task={task_language[:40]}")
 
         if step > 0 and step % cfg["eval_every"] == 0:
             _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device)
@@ -198,11 +250,12 @@ def train(cfg):
 
 
 def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device):
-    """Quick eval on 3 random tasks, 5 episodes each, using the same pipeline as evaluate.py."""
+    """Quick eval on 3 random tasks, n_eval_episodes each, on the held-out init states."""
     policy.eval()
     n_sample = min(3, n_tasks)
     task_ids = random.sample(range(n_tasks), n_sample)
     results = []
+    n_train_inits = cfg.get("n_train_init_states", 40)
     for tid in task_ids:
         env = LiberoEnv(
             task_suite=suite,
@@ -211,8 +264,9 @@ def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, pos
             obs_type="pixels_agent_pos",
             observation_height=256,
             observation_width=256,
+            episode_index=n_train_inits,
         )
-        n_ep = cfg.get("n_eval_episodes", 5)
+        n_ep = min(cfg.get("n_eval_episodes", 5), 50 - n_train_inits)
         success_count = 0
         for _ in range(n_ep):
             policy.reset()
