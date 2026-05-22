@@ -32,9 +32,12 @@ def _worker_loop(conn, suite_name):
     # the GPU device for the offscreen render context, and an empty value crashes
     # with "invalid literal for int() with base 10: ''".
     # Workers won't allocate CUDA memory unless they explicitly call .cuda(); they don't.
-    # Avoid OpenMP / MKL thread oversubscription when N workers run in parallel.
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    # Avoid BLAS thread oversubscription when N workers run in parallel. With
+    # fork mode this is already inherited from main (where it must be set before
+    # numpy import), but setting it here too covers spawn mode.
+    for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_v, "1")
 
     def _send(*args):
         conn.send(args)
@@ -161,12 +164,20 @@ class ParallelEnvPool:
     Use as a context manager or call .close() explicitly.
     """
 
-    def __init__(self, n_workers: int, suite_name: str, startup_timeout: float = 120.0):
+    def __init__(self, n_workers: int, suite_name: str, startup_timeout: float = 300.0,
+                 start_method: str = "fork"):
+        """
+        start_method: "fork" (fast — workers inherit imports from main) or "spawn"
+                      (slow — each worker re-imports the full stack, ~60-120s).
+                      Use "fork" ONLY if CUDA has not been initialized in main yet
+                      (i.e. create the pool BEFORE loading the policy to GPU).
+        """
         self.n_workers = n_workers
         self.suite_name = suite_name
-        ctx = mp.get_context("spawn")
+        ctx = mp.get_context(start_method)
         self.parents = []
         self.workers = []
+        print(f"  Starting {n_workers} workers via {start_method} ...", flush=True)
         for _ in range(n_workers):
             parent, child = ctx.Pipe()
             p = ctx.Process(target=_worker_loop, args=(child, suite_name), daemon=True)
@@ -177,15 +188,19 @@ class ParallelEnvPool:
         # Wait for every worker to signal readiness (post-import). If any worker
         # crashed during import, surface the traceback here instead of failing
         # silently later with BrokenPipeError on the first send.
+        n_ready = 0
         for i, parent in enumerate(self.parents):
             if not parent.poll(timeout=startup_timeout):
                 self._terminate_all()
                 raise RuntimeError(
                     f"worker {i} did not signal ready within {startup_timeout}s — "
-                    "check stderr for crash traceback (likely MuJoCo GL or import error)"
+                    f"({n_ready}/{n_workers} ready). Check stderr for crash traceback "
+                    "(likely MuJoCo GL or import error)."
                 )
             resp = parent.recv()
             if resp[0] == "ready":
+                n_ready += 1
+                print(f"  Worker {i} ready ({n_ready}/{n_workers})", flush=True)
                 continue
             if resp[0] == "startup_error":
                 self._terminate_all()

@@ -7,7 +7,17 @@ import random
 # Must be set before the CUDA allocator initialises (before first .to("cuda"))
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+# Cap BLAS thread counts BEFORE numpy / scipy / torch are imported, otherwise
+# each library spawns one thread per CPU core (often 64). With n_group worker
+# processes, that hits the container's process/thread limit and crashes with
+# `pthread_create failed: Resource temporarily unavailable`.
+# With fork mode these env vars also propagate to worker processes.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import torch
+torch.set_num_threads(1)
 import yaml
 from huggingface_hub import hf_hub_download
 from libero.libero import benchmark
@@ -106,6 +116,18 @@ def train(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # === STEP 1: spawn worker pool BEFORE touching CUDA ===
+    # With start_method="fork", workers inherit main's already-imported modules
+    # (libero, lerobot, transformers) without re-importing, so spawn is near-instant.
+    # But fork after CUDA init causes worker CUDA-context corruption — so we must
+    # create the pool BEFORE policy.to("cuda").
+    use_parallel = cfg.get("use_parallel_rollout", False)
+    pool = None
+    if use_parallel:
+        print(f"Spawning ParallelEnvPool with {cfg['n_group']} workers (fork mode) ...")
+        pool = ParallelEnvPool(cfg["n_group"], cfg["task_suite"], start_method="fork")
+
+    # === STEP 2: load policy and move to GPU (initializes CUDA in main only) ===
     print(f"Loading policy from {cfg['model_id']} ...")
     policy = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
     policy_ref = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
@@ -137,15 +159,6 @@ def train(cfg):
     n_tasks = suite.get_num_tasks()
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
-
-    # Optional parallel rollout pool: spawns n_group worker processes that each hold
-    # one LiberoEnv. Trades subprocess overhead for ~n_group× wall-clock speedup on
-    # the env-bound rollout phase. Pool persists for the whole training run.
-    use_parallel = cfg.get("use_parallel_rollout", False)
-    pool = None
-    if use_parallel:
-        print(f"Spawning ParallelEnvPool with {cfg['n_group']} workers ...")
-        pool = ParallelEnvPool(cfg["n_group"], cfg["task_suite"])
 
     print(f"Starting GRPO training for {cfg['total_steps']} steps ...")
     for step in range(cfg["total_steps"]):
