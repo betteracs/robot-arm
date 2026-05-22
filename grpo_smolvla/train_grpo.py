@@ -500,6 +500,8 @@ def train_multi_gpu(cfg):
             if msg[0] == "error":
                 print(f"  [step {step}] Worker {i} reset error: {msg[1]} — skipping step")
                 reset_ok = False
+                for drain_rq in recv_queues[i + 1:]:
+                    drain_rq.get(timeout=120)
                 break
             if msg[0] == "obs":
                 _, obs_list, task_language, env_max = msg
@@ -534,6 +536,8 @@ def train_multi_gpu(cfg):
             if msg[0] == "error":
                 print(f"  [step {step}] Worker {i} rollout error: {msg[1]} — skipping step")
                 rollout_ok = False
+                for drain_rq in recv_queues[i + 1:]:
+                    drain_rq.get(timeout=300)
                 break
             per_level_rewards[level] = msg[1]
 
@@ -566,7 +570,9 @@ def train_multi_gpu(cfg):
         for param in policy.parameters():
             dist.broadcast(param.data, src=0)
         for rq in recv_queues:
-            rq.get(timeout=60)
+            sync_resp = rq.get(timeout=60)
+            if sync_resp[0] != "synced":
+                print(f"  [warning] Unexpected sync response: {sync_resp}", flush=True)
 
         if step > 0 and step % cfg["eval_every"] == 0:
             _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor,
