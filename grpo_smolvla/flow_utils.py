@@ -46,8 +46,10 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     Run Euler integration for num_steps steps from a fixed noise tensor.
     Returns action chunk of shape (B, chunk_size, action_dim).
 
-    Bypasses policy.config.num_steps so we can request 8, 9, or 10 steps
-    without mutating config state (thread-safe).
+    Bypasses policy.config.num_steps so we can request arbitrary step counts
+    without mutating config state (thread-safe). The same noise vector produces
+    different chunks at different step counts purely through Euler discretization
+    error — all integrations reach t=0, just at different fidelities.
     """
     dt = -1.0 / num_steps
     x_t = noise.clone()
@@ -68,18 +70,24 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     return x_t
 
 
-def sample_group_trajectories(policy, obs_batch, n_group=8):
+def sample_group_trajectories(policy, obs_batch, denoise_levels=(5, 8, 10), n_group=8):
     """
-    Sample n_group independent trajectories from the policy for a single observation.
+    Sample n_group independent noise vectors and produce one action chunk per
+    denoising-step budget per noise.
 
     Calls embed_prefix once (expensive VLM + KV-cache forward) and reuses the KV
-    cache across all n_group noise vectors and all 3 denoising horizons per vector.
+    cache across all n_group noise vectors and all len(denoise_levels) horizons.
 
     Actions are trimmed to original_action_dim (e.g. 7 for LIBERO) — matching what
     SmolVLAPolicy._get_action_chunk does — so they are compatible with the postprocessor.
     The noise tensor stays at max_action_dim (32) for correct FM loss computation.
 
-    Returns list of dicts, each with keys: noise, actions_8, actions_9, actions_10.
+    Returns list of dicts, each with keys:
+        noise:           (B, chunk_size, max_action_dim)
+        actions:         dict[int, Tensor] keyed by step count, values
+                         (B, chunk_size, original_action_dim)
+        primary_actions: actions[max(denoise_levels)] — the canonical-inference
+                         trajectory used by the GRPO log-prob.
     """
     model = policy.model  # VLAFlowMatching
     B = 1
@@ -91,12 +99,18 @@ def sample_group_trajectories(policy, obs_batch, n_group=8):
     original_action_dim = policy.config.action_feature.shape[0]
 
     prefix_cache = compute_prefix_cache(policy, obs_batch)
+    primary_level = max(denoise_levels)
 
     group = []
     for _ in range(n_group):
         zi = torch.randn(action_shape, device=device, dtype=model_dtype)
-        a8  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=8)[:, :, :original_action_dim]
-        a9  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=9)[:, :, :original_action_dim]
-        a10 = rollout_with_n_steps(model, prefix_cache, zi, num_steps=10)[:, :, :original_action_dim]
-        group.append({"noise": zi, "actions_8": a8, "actions_9": a9, "actions_10": a10})
+        actions = {
+            int(d): rollout_with_n_steps(model, prefix_cache, zi, num_steps=int(d))[:, :, :original_action_dim]
+            for d in denoise_levels
+        }
+        group.append({
+            "noise": zi,
+            "actions": actions,
+            "primary_actions": actions[primary_level],
+        })
     return group
