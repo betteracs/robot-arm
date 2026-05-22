@@ -436,7 +436,6 @@ def train_multi_gpu(cfg):
             target=worker_main,
             args=(rank, world_size, level, is_primary, cfg,
                   send_queues[i], recv_queues[i], master_addr, master_port),
-            daemon=True,
         )
         p.start()
         worker_procs.append(p)
