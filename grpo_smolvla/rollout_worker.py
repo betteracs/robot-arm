@@ -12,6 +12,8 @@ Each worker process:
 import datetime
 import os
 
+import numpy as np
+
 # Must be set before any numpy/torch imports in this process.
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -145,12 +147,14 @@ def worker_main(
     # Force headless GL so the forked env workers survive on headless servers.
     os.environ.setdefault("MUJOCO_GL", "egl")
 
+    print(f"[Worker rank={rank} level={denoise_level}] Creating ParallelEnvPool ...", flush=True)
     n_env_workers = cfg["n_group"]
     pool = ParallelEnvPool(n_env_workers, cfg["task_suite"], start_method="fork")
 
     # ------------------------------------------------------------------
     # STEP 2: Load policy to this worker's GPU (CUDA initialises here).
     # ------------------------------------------------------------------
+    print(f"[Worker rank={rank} level={denoise_level}] Loading policy ...", flush=True)
     device = f"cuda:{rank}"  # rank 0 is the trainer; workers use their own rank GPU
     policy_inference = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(
         device=device, dtype=torch.bfloat16
@@ -188,6 +192,7 @@ def worker_main(
     # ------------------------------------------------------------------
     # STEP 5: Signal readiness to trainer.
     # ------------------------------------------------------------------
+    print(f"[Worker rank={rank} level={denoise_level}] Joined dist group. Ready.", flush=True)
     recv_q.put(("ready",))
 
     # ------------------------------------------------------------------
@@ -199,7 +204,7 @@ def worker_main(
             cmd = msg[0]
 
             if cmd == "reset":
-                _, task_id, episode_indices, max_steps = msg
+                _, task_id, episode_indices, _ = msg
                 try:
                     obs_list, task_language, env_max_steps = pool.reset_to_task(
                         task_id, episode_indices
