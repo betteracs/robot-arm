@@ -18,8 +18,8 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 
 import datetime
 import multiprocessing as _mp
+from queue import Empty as _QueueEmpty
 
-import numpy as np
 import torch
 torch.set_num_threads(1)
 import torch.distributed as dist
@@ -467,134 +467,145 @@ def train_multi_gpu(cfg):
         world_size=world_size,
         timeout=datetime.timedelta(minutes=10),
     )
-
-    for i, rq in enumerate(recv_queues):
-        msg = rq.get(timeout=300)
-        if msg[0] != "ready":
-            raise RuntimeError(f"Worker {i} (level={denoise_levels[i]}) failed startup: {msg}")
-    print("All workers ready. Starting training ...", flush=True)
-
-    bd = benchmark.get_benchmark_dict()
-    suite = bd[cfg["task_suite"]]()
-    n_tasks = suite.get_num_tasks()
-    n_train_inits = cfg.get("n_train_init_states", 40)
-    model_dtype = next(policy.parameters()).dtype
-    os.makedirs(cfg["output_dir"], exist_ok=True)
-
-    for step in range(cfg["total_steps"]):
-        task_id = random.randint(0, n_tasks - 1)
-        episode_start = (step * cfg["n_group"]) % n_train_inits
-        episode_indices = [(episode_start + i) % n_train_inits for i in range(cfg["n_group"])]
-        max_steps_cap = int(cfg.get("max_episode_steps_train", 520))
-
-        # ── Phase 1: reset all workers ───────────────────────────────────────
-        for sq in send_queues:
-            sq.put(("reset", task_id, episode_indices, max_steps_cap))
-
-        obs_list = None
-        task_language = None
-        max_steps = max_steps_cap
-        reset_ok = True
+    try:
         for i, rq in enumerate(recv_queues):
-            msg = rq.get(timeout=120)
-            if msg[0] == "error":
-                print(f"  [step {step}] Worker {i} reset error: {msg[1]} — skipping step")
-                reset_ok = False
-                for drain_rq in recv_queues[i + 1:]:
-                    drain_rq.get(timeout=120)
-                break
-            if msg[0] == "obs":
-                _, obs_list, task_language, env_max = msg
-                max_steps = min(max_steps_cap, env_max)
-
-        if not reset_ok or obs_list is None:
-            continue
-
-        # ── Phase 2: sample trajectories on trainer GPU ──────────────────────
-        group_episodes = []
-        for obs in obs_list:
-            obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
-            obs_batch_i = cast_batch(obs_batch_i, model_dtype)
-            traj_i = sample_group_trajectories(
-                policy, obs_batch_i, denoise_levels=denoise_levels, n_group=1,
-            )[0]
-            group_episodes.append({"obs_batch": obs_batch_i, "traj": traj_i})
-
-        # ── Phase 3: send first chunks to each worker ────────────────────────
-        for i, level in enumerate(denoise_levels):
-            first_chunks = [
-                postprocessor(ep["traj"]["actions"][level]).squeeze(0).cpu().float().numpy()
-                for ep in group_episodes
-            ]
-            send_queues[i].put(("rollout", first_chunks, task_language, max_steps))
-
-        # ── Phase 4: collect rewards (workers ran in parallel) ───────────────
-        per_level_rewards = {}
-        rollout_ok = True
-        for i, (level, rq) in enumerate(zip(denoise_levels, recv_queues)):
             msg = rq.get(timeout=300)
-            if msg[0] == "error":
-                print(f"  [step {step}] Worker {i} rollout error: {msg[1]} — skipping step")
-                rollout_ok = False
-                for drain_rq in recv_queues[i + 1:]:
-                    drain_rq.get(timeout=300)
-                break
-            per_level_rewards[level] = msg[1]
+            if msg[0] != "ready":
+                raise RuntimeError(f"Worker {i} (level={denoise_levels[i]}) failed startup: {msg}")
+        print("All workers ready. Starting training ...", flush=True)
 
-        if not rollout_ok:
-            continue
+        bd = benchmark.get_benchmark_dict()
+        suite = bd[cfg["task_suite"]]()
+        n_tasks = suite.get_num_tasks()
+        n_train_inits = cfg.get("n_train_init_states", 40)
+        model_dtype = next(policy.parameters()).dtype
+        os.makedirs(cfg["output_dir"], exist_ok=True)
 
-        rewards = [
-            sum(denoising_weights[d] * per_level_rewards[d][i] for d in denoise_levels)
-            for i in range(cfg["n_group"])
-        ]
-        advantages = compute_grpo_advantages(rewards)
-        rewards_str = "[" + ",".join(f"{r:.1f}" for r in rewards) + "]"
+        for step in range(cfg["total_steps"]):
+            task_id = random.randint(0, n_tasks - 1)
+            episode_start = (step * cfg["n_group"]) % n_train_inits
+            episode_indices = [(episode_start + i) % n_train_inits for i in range(cfg["n_group"])]
+            max_steps_cap = int(cfg.get("max_episode_steps_train", 520))
 
-        if len(set(rewards)) == 1:
-            print(f"Step {step:5d} | skip (uniform rewards={rewards_str}) | task={task_language[:40]}")
-            continue
+            # ── Phase 1: reset all workers ───────────────────────────────────────
+            for sq in send_queues:
+                sq.put(("reset", task_id, episode_indices, max_steps_cap))
 
-        # ── Phase 5: gradient update ─────────────────────────────────────────
-        loss = grpo_update(
-            policy, policy_ref, optimizer, group_episodes, advantages,
-            clip_eps=cfg["clip_eps"], kl_coeff=cfg["kl_coeff"],
-        )
-        mean_r = sum(rewards) / len(rewards)
-        print(f"Step {step:5d} | loss={loss:.4f} | mean_reward={mean_r:.3f} "
-              f"| rewards={rewards_str} | task={task_language[:40]}")
+            obs_list = None
+            task_language = None
+            max_steps = max_steps_cap
+            reset_ok = True
+            for i, rq in enumerate(recv_queues):
+                msg = rq.get(timeout=120)
+                if msg[0] == "error":
+                    print(f"  [step {step}] Worker {i} reset error: {msg[1]} — skipping step")
+                    reset_ok = False
+                    for drain_rq in recv_queues[i + 1:]:
+                        try:
+                            drain_rq.get(timeout=120)
+                        except _QueueEmpty:
+                            pass
+                    break
+                if msg[0] == "obs":
+                    _, obs_list, task_language, env_max = msg
+                    max_steps = min(max_steps_cap, env_max)
 
-        # ── Phase 6: broadcast updated weights ───────────────────────────────
+            if not reset_ok or obs_list is None:
+                if obs_list is None and reset_ok:
+                    print(f"  [step {step}] Primary worker failed to return obs — skipping step")
+                continue
+
+            # ── Phase 2: sample trajectories on trainer GPU ──────────────────────
+            group_episodes = []
+            for obs in obs_list:
+                obs_batch_i = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
+                obs_batch_i = cast_batch(obs_batch_i, model_dtype)
+                traj_i = sample_group_trajectories(
+                    policy, obs_batch_i, denoise_levels=denoise_levels, n_group=1,
+                )[0]
+                group_episodes.append({"obs_batch": obs_batch_i, "traj": traj_i})
+
+            # ── Phase 3: send first chunks to each worker ────────────────────────
+            for i, level in enumerate(denoise_levels):
+                first_chunks = [
+                    postprocessor(ep["traj"]["actions"][level]).squeeze(0).cpu().float().numpy()
+                    for ep in group_episodes
+                ]
+                send_queues[i].put(("rollout", first_chunks, task_language, max_steps))
+
+            # ── Phase 4: collect rewards (workers ran in parallel) ───────────────
+            per_level_rewards = {}
+            rollout_ok = True
+            for i, (level, rq) in enumerate(zip(denoise_levels, recv_queues)):
+                msg = rq.get(timeout=300)
+                if msg[0] == "error":
+                    print(f"  [step {step}] Worker {i} rollout error: {msg[1]} — skipping step")
+                    rollout_ok = False
+                    for drain_rq in recv_queues[i + 1:]:
+                        try:
+                            drain_rq.get(timeout=300)
+                        except _QueueEmpty:
+                            pass
+                    break
+                per_level_rewards[level] = msg[1]
+
+            if not rollout_ok:
+                continue
+
+            rewards = [
+                sum(denoising_weights[d] * per_level_rewards[d][i] for d in denoise_levels)
+                for i in range(cfg["n_group"])
+            ]
+            advantages = compute_grpo_advantages(rewards)
+            rewards_str = "[" + ",".join(f"{r:.1f}" for r in rewards) + "]"
+
+            if len(set(rewards)) == 1:
+                print(f"Step {step:5d} | skip (uniform rewards={rewards_str}) | task={task_language[:40]}")
+                continue
+
+            # ── Phase 5: gradient update ─────────────────────────────────────────
+            loss = grpo_update(
+                policy, policy_ref, optimizer, group_episodes, advantages,
+                clip_eps=cfg["clip_eps"], kl_coeff=cfg["kl_coeff"],
+            )
+            mean_r = sum(rewards) / len(rewards)
+            print(f"Step {step:5d} | loss={loss:.4f} | mean_reward={mean_r:.3f} "
+                  f"| rewards={rewards_str} | task={task_language[:40]}")
+
+            # ── Phase 6: broadcast updated weights ───────────────────────────────
+            for sq in send_queues:
+                sq.put(("sync_weights",))
+            for param in policy.parameters():
+                dist.broadcast(param.data, src=0)
+            for rq in recv_queues:
+                sync_resp = rq.get(timeout=60)
+                if sync_resp[0] != "synced":
+                    print(f"  [warning] Unexpected sync response: {sync_resp}", flush=True)
+
+            if step > 0 and step % cfg["eval_every"] == 0:
+                _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor,
+                            preprocessor, postprocessor, device)
+
+            if step > 0 and step % cfg["save_every"] == 0:
+                ckpt_path = os.path.join(cfg["output_dir"], f"step_{step}")
+                policy.save_pretrained(ckpt_path)
+                print(f"  Checkpoint saved → {ckpt_path}")
+
+        final_path = os.path.join(cfg["output_dir"], f"step_{cfg['total_steps']}")
+        policy.save_pretrained(final_path)
+        print(f"Training complete. Final checkpoint → {final_path}")
+    finally:
         for sq in send_queues:
-            sq.put(("sync_weights",))
-        for param in policy.parameters():
-            dist.broadcast(param.data, src=0)
-        for rq in recv_queues:
-            sync_resp = rq.get(timeout=60)
-            if sync_resp[0] != "synced":
-                print(f"  [warning] Unexpected sync response: {sync_resp}", flush=True)
-
-        if step > 0 and step % cfg["eval_every"] == 0:
-            _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor,
-                        preprocessor, postprocessor, device)
-
-        if step > 0 and step % cfg["save_every"] == 0:
-            ckpt_path = os.path.join(cfg["output_dir"], f"step_{step}")
-            policy.save_pretrained(ckpt_path)
-            print(f"  Checkpoint saved → {ckpt_path}")
-
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    for sq in send_queues:
-        sq.put(("stop",))
-    for p in worker_procs:
-        p.join(timeout=30)
-        if p.is_alive():
-            p.terminate()
-    dist.destroy_process_group()
-
-    final_path = os.path.join(cfg["output_dir"], f"step_{cfg['total_steps']}")
-    policy.save_pretrained(final_path)
-    print(f"Training complete. Final checkpoint → {final_path}")
+            try:
+                sq.put(("stop",))
+            except Exception:
+                pass
+        for p in worker_procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def main():
