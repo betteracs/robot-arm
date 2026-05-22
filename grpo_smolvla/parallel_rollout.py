@@ -11,24 +11,53 @@ n_group× wall-clock speedup on the env-bound phase.
 """
 
 import multiprocessing as mp
+import os
+import sys
+import traceback
 from typing import Any
 
 import numpy as np
 import torch
 
-from libero.libero import benchmark
-from lerobot.envs.libero import LiberoEnv
-
 
 def _worker_loop(conn, suite_name):
-    """Worker process: owns one LiberoEnv at a time. Responds to messages on `conn`."""
-    bd = benchmark.get_benchmark_dict()
-    suite = bd[suite_name]()
-    env = None
+    """Worker process: owns one LiberoEnv at a time. Responds to messages on `conn`.
+
+    Sets headless GL + disables CUDA for the worker BEFORE importing libero/lerobot,
+    otherwise on headless servers (Vast.ai, Docker) the worker dies during import.
+    """
+    # Force headless GL backend. EGL is the most reliable on Linux servers without X.
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    # Don't clobber CUDA_VISIBLE_DEVICES — robosuite's EGL renderer uses it to pick
+    # the GPU device for the offscreen render context, and an empty value crashes
+    # with "invalid literal for int() with base 10: ''".
+    # Workers won't allocate CUDA memory unless they explicitly call .cuda(); they don't.
+    # Avoid OpenMP / MKL thread oversubscription when N workers run in parallel.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
 
     def _send(*args):
         conn.send(args)
 
+    try:
+        # Lazy import so env vars above take effect.
+        from libero.libero import benchmark
+        from lerobot.envs.libero import LiberoEnv
+        bd = benchmark.get_benchmark_dict()
+        suite = bd[suite_name]()
+    except Exception as e:
+        # Startup failed — report the full traceback to main before dying.
+        tb = traceback.format_exc()
+        try:
+            _send("startup_error", f"{type(e).__name__}: {e}\n{tb}")
+        except Exception:
+            print(f"[worker] startup error (could not send): {e}\n{tb}", file=sys.stderr, flush=True)
+        return
+
+    # Signal readiness so main knows the worker survived imports.
+    _send("ready")
+
+    env = None
     try:
         while True:
             msg = conn.recv()
@@ -132,7 +161,7 @@ class ParallelEnvPool:
     Use as a context manager or call .close() explicitly.
     """
 
-    def __init__(self, n_workers: int, suite_name: str):
+    def __init__(self, n_workers: int, suite_name: str, startup_timeout: float = 120.0):
         self.n_workers = n_workers
         self.suite_name = suite_name
         ctx = mp.get_context("spawn")
@@ -145,6 +174,32 @@ class ParallelEnvPool:
             self.parents.append(parent)
             self.workers.append(p)
 
+        # Wait for every worker to signal readiness (post-import). If any worker
+        # crashed during import, surface the traceback here instead of failing
+        # silently later with BrokenPipeError on the first send.
+        for i, parent in enumerate(self.parents):
+            if not parent.poll(timeout=startup_timeout):
+                self._terminate_all()
+                raise RuntimeError(
+                    f"worker {i} did not signal ready within {startup_timeout}s — "
+                    "check stderr for crash traceback (likely MuJoCo GL or import error)"
+                )
+            resp = parent.recv()
+            if resp[0] == "ready":
+                continue
+            if resp[0] == "startup_error":
+                self._terminate_all()
+                raise RuntimeError(f"worker {i} startup failed:\n{resp[1]}")
+            self._terminate_all()
+            raise RuntimeError(f"worker {i} sent unexpected message during startup: {resp}")
+
+    def _terminate_all(self):
+        for p in self.workers:
+            if p.is_alive():
+                p.terminate()
+        for p in self.workers:
+            p.join(timeout=2)
+
     def reset_to_task(self, task_id: int, episode_indices: list[int]):
         """Reset all workers to the same task, each with its own init state.
 
@@ -152,14 +207,28 @@ class ParallelEnvPool:
         Raises RuntimeError if any worker fails.
         """
         assert len(episode_indices) == self.n_workers
-        for parent, ep_idx in zip(self.parents, episode_indices):
-            parent.send(("init", task_id, ep_idx))
+
+        # Verify all workers are still alive before sending, so we get a clear
+        # error message instead of BrokenPipeError on the first dead one.
+        dead = [i for i, p in enumerate(self.workers) if not p.is_alive()]
+        if dead:
+            raise RuntimeError(f"worker(s) {dead} are dead (exit codes: "
+                               f"{[self.workers[i].exitcode for i in dead]})")
+
+        for i, (parent, ep_idx) in enumerate(zip(self.parents, episode_indices)):
+            try:
+                parent.send(("init", task_id, ep_idx))
+            except (BrokenPipeError, OSError) as e:
+                raise RuntimeError(f"send to worker {i} failed ({e}); worker likely died")
 
         obs_list = []
         task_desc = None
         max_steps = None
         for i, parent in enumerate(self.parents):
-            resp = parent.recv()
+            try:
+                resp = parent.recv()
+            except (EOFError, OSError) as e:
+                raise RuntimeError(f"recv from worker {i} failed ({e}); worker died mid-init")
             if resp[0] != "ok":
                 raise RuntimeError(f"worker {i} init failed: {resp[1] if len(resp) > 1 else ''}")
             obs_list.append(resp[1])
