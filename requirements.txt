@@ -1,0 +1,12 @@
+num2words
+pyyaml
+transformers==4.57.6
+lerobot==0.4.4
+robosuite==1.4.0
+bddl==1.0.1
+future==0.18.2
+easydict==1.9
+matplotlib
+gym==0.25.2
+gym-notices==0.1.0
+gymnasium==1.3.0
